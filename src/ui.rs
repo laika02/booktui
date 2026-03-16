@@ -208,6 +208,7 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw("a add dir  "),
             Span::raw("/ filter  "),
             Span::raw("s sort  "),
+            Span::raw("e seek by  "),
             Span::raw("d drop root  "),
             Span::raw("Enter play  "),
             Span::raw("Space pause  "),
@@ -410,13 +411,22 @@ pub fn format_duration(duration: Duration) -> String {
 }
 
 fn truncate_middle(text: &str, max_len: usize) -> String {
-    if max_len < 8 || text.len() <= max_len {
+    let chars: Vec<char> = text.chars().collect();
+    if max_len < 8 || chars.len() <= max_len {
         return text.to_owned();
     }
 
     let keep = (max_len.saturating_sub(1)) / 2;
-    let start = &text[..keep];
-    let end = &text[text.len().saturating_sub(keep)..];
+    let start: String = chars.iter().take(keep).collect();
+    let end: String = chars
+        .iter()
+        .rev()
+        .take(keep)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{start}…{end}")
 }
 

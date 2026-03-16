@@ -33,6 +33,7 @@ pub enum InputMode {
     Normal,
     AddDirectory,
     Search,
+    Seek,
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +229,7 @@ impl App {
         match self.input_mode {
             InputMode::AddDirectory => "Add Directory",
             InputMode::Search => "Filter Library",
+            InputMode::Seek => "Seek By",
             InputMode::Normal => "",
         }
     }
@@ -236,6 +238,7 @@ impl App {
         match self.input_mode {
             InputMode::AddDirectory => "Type a path. Tab completes. Enter saves. Esc cancels.",
             InputMode::Search => "Type to filter. Enter keeps it. Esc clears and exits.",
+            InputMode::Seek => "Examples: 1m, -1m, +30s, +1h2m3s. Enter applies.",
             InputMode::Normal => "",
         }
     }
@@ -270,6 +273,7 @@ impl App {
             InputMode::Normal => self.handle_normal_mode(key),
             InputMode::AddDirectory => self.handle_add_directory_mode(key),
             InputMode::Search => self.handle_search_mode(key),
+            InputMode::Seek => self.handle_seek_mode(key),
         }
     }
 
@@ -278,6 +282,7 @@ impl App {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('a') => self.begin_input(InputMode::AddDirectory, String::new()),
             KeyCode::Char('/') => self.begin_input(InputMode::Search, self.filter_query.clone()),
+            KeyCode::Char('e') => self.begin_input(InputMode::Seek, String::new()),
             KeyCode::Char('r') => self.rescan_library()?,
             KeyCode::Char('d') => self.remove_selected_root()?,
             KeyCode::Char('s') => self.cycle_sort_mode()?,
@@ -350,6 +355,26 @@ impl App {
                 } else {
                     format!("Filtering library by '{}'.", self.filter_query)
                 };
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_seek_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.handle_shared_input_key(key)? {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.status = "Seek canceled.".to_owned();
+            }
+            KeyCode::Enter => {
+                self.apply_seek_input()?;
+                self.input_mode = InputMode::Normal;
             }
             _ => {}
         }
@@ -668,6 +693,25 @@ impl App {
         Ok(())
     }
 
+    fn apply_seek_input(&mut self) -> Result<()> {
+        let Some(parsed) = parse_seek_spec(self.input_buffer.trim()) else {
+            self.status = "Invalid seek. Use forms like 1m, -30s, +1h2m3s.".to_owned();
+            return Ok(());
+        };
+
+        let current = self.player.current_position();
+        let target = match parsed {
+            SeekSpec::Absolute(duration) => duration,
+            SeekSpec::RelativeForward(duration) => current.saturating_add(duration),
+            SeekSpec::RelativeBackward(duration) => current.saturating_sub(duration),
+        };
+
+        self.player.seek_to(target)?;
+        self.persist_current_resume()?;
+        self.status = format!("Seeked to {}", ui::format_duration(target));
+        Ok(())
+    }
+
     fn handle_mouse_event(&mut self, area: Rect, column: u16, row: u16) -> Result<()> {
         match ui::hit_test(area, column, row) {
             Some(HitTarget::Timeline { area }) => {
@@ -971,4 +1015,71 @@ fn ensure_trailing_slash(text: &str) -> String {
     } else {
         format!("{text}/")
     }
+}
+
+enum SeekSpec {
+    Absolute(Duration),
+    RelativeForward(Duration),
+    RelativeBackward(Duration),
+}
+
+fn parse_seek_spec(input: &str) -> Option<SeekSpec> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (mode, rest) = if let Some(rest) = trimmed.strip_prefix('+') {
+        (1i8, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('-') {
+        (-1i8, rest)
+    } else {
+        (0i8, trimmed)
+    };
+
+    let duration = parse_duration_expr(rest)?;
+    if duration.is_zero() {
+        return None;
+    }
+
+    Some(match mode {
+        1 => SeekSpec::RelativeForward(duration),
+        -1 => SeekSpec::RelativeBackward(duration),
+        _ => SeekSpec::Absolute(duration),
+    })
+}
+
+fn parse_duration_expr(input: &str) -> Option<Duration> {
+    let mut chars = input.chars().peekable();
+    let mut total_seconds = 0u64;
+    let mut saw_unit = false;
+
+    while chars.peek().is_some() {
+        let mut number = String::new();
+        while let Some(ch) = chars.peek() {
+            if ch.is_ascii_digit() {
+                number.push(*ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if number.is_empty() {
+            return None;
+        }
+
+        let value: u64 = number.parse().ok()?;
+        let unit = chars.next()?;
+        let seconds = match unit {
+            'h' | 'H' => value.checked_mul(3600)?,
+            'm' | 'M' => value.checked_mul(60)?,
+            's' | 'S' => value,
+            _ => return None,
+        };
+        total_seconds = total_seconds.checked_add(seconds)?;
+        saw_unit = true;
+    }
+
+    saw_unit.then(|| Duration::from_secs(total_seconds))
 }

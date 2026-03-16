@@ -5,7 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player as RodioPlayer, Source};
+use rodio::{
+    Decoder, DeviceSinkBuilder, MixerDeviceSink, Player as RodioPlayer, Source, cpal::BufferSize,
+};
 
 #[derive(Debug)]
 pub struct PlaybackSnapshot {
@@ -25,7 +27,11 @@ pub struct Player {
 
 impl Player {
     pub fn new(default_volume: u8) -> Result<Self> {
-        let sink = DeviceSinkBuilder::open_default_sink()
+        let sink = DeviceSinkBuilder::from_default_device()
+            .context("failed to open default audio output device")?
+            .with_buffer_size(BufferSize::Fixed(4096))
+            .with_error_callback(|_| {})
+            .open_sink_or_fallback()
             .context("failed to open default audio output device")?;
         let player = RodioPlayer::connect_new(sink.mixer());
         let volume = default_volume.min(100);
