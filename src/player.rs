@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -14,7 +15,14 @@ pub struct PlaybackSnapshot {
     pub position: Duration,
     pub duration: Option<Duration>,
     pub volume: u8,
+    pub speed: f32,
     pub is_paused: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Chapter {
+    pub title: Option<String>,
+    pub position: Duration,
 }
 
 pub struct Player {
@@ -22,7 +30,9 @@ pub struct Player {
     player: RodioPlayer,
     file: Option<PathBuf>,
     duration: Option<Duration>,
+    chapters: Vec<Chapter>,
     volume: u8,
+    speed: f32,
 }
 
 impl Player {
@@ -42,7 +52,9 @@ impl Player {
             player,
             file: None,
             duration: None,
+            chapters: Vec::new(),
             volume,
+            speed: 1.0,
         })
     }
 
@@ -51,6 +63,7 @@ impl Player {
             position: self.current_position(),
             duration: self.duration,
             volume: self.volume,
+            speed: self.speed,
             is_paused: self.is_paused(),
         })
     }
@@ -63,9 +76,11 @@ impl Player {
         let decoder = Decoder::try_from(file)
             .with_context(|| format!("failed to decode {}", path.display()))?;
         let duration = decoder.total_duration();
+        let chapters = probe_chapters(path);
 
         self.player.append(decoder);
         self.player.set_volume(volume_to_float(self.volume));
+        self.player.set_speed(self.speed);
 
         if !start_at.is_zero() {
             self.player
@@ -75,6 +90,7 @@ impl Player {
 
         self.file = Some(path.to_path_buf());
         self.duration = duration;
+        self.chapters = chapters;
         Ok(())
     }
 
@@ -100,6 +116,7 @@ impl Player {
         self.player.stop();
         self.file = None;
         self.duration = None;
+        self.chapters.clear();
         Ok(())
     }
 
@@ -122,6 +139,11 @@ impl Player {
         self.volume = volume.min(100);
         self.player.set_volume(volume_to_float(self.volume));
         Ok(())
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed;
+        self.player.set_speed(speed);
     }
 
     pub fn seek_to(&mut self, target: Duration) -> Result<()> {
@@ -169,12 +191,20 @@ impl Player {
         self.duration
     }
 
+    pub fn chapters(&self) -> &[Chapter] {
+        &self.chapters
+    }
+
     pub fn current_file(&self) -> Option<&Path> {
         self.file.as_deref()
     }
 
     pub fn volume(&self) -> u8 {
         self.volume
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
     }
 
     #[allow(dead_code)]
@@ -185,4 +215,58 @@ impl Player {
 
 fn volume_to_float(volume: u8) -> f32 {
     (volume.min(100) as f32 / 100.0).clamp(0.0, 1.0)
+}
+
+fn probe_chapters(path: &Path) -> Vec<Chapter> {
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("m4b"))
+    {
+        return Vec::new();
+    }
+
+    let output = match Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("chapter=start_time:chapter_tags=title")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1")
+        .arg(path)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut chapters = Vec::new();
+    let mut current_start: Option<f64> = None;
+    let mut current_title = None;
+
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("start_time=") {
+            if let Some(start) = current_start.take() {
+                chapters.push(Chapter {
+                    title: current_title.take(),
+                    position: Duration::from_secs_f64(start.max(0.0)),
+                });
+            }
+            current_start = value.parse::<f64>().ok();
+        } else if let Some(value) = line.strip_prefix("TAG:title=") {
+            current_title = Some(value.to_owned());
+        }
+    }
+
+    if let Some(start) = current_start {
+        chapters.push(Chapter {
+            title: current_title,
+            position: Duration::from_secs_f64(start.max(0.0)),
+        });
+    }
+
+    chapters.sort_by_key(|chapter| chapter.position);
+    chapters.dedup_by_key(|chapter| chapter.position);
+    chapters
 }

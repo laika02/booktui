@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub library_dirs: Vec<String>,
     pub default_volume: u8,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: String,
+    #[serde(default = "default_memory_on_move")]
+    pub memory_on_move: bool,
 }
 
 impl Default for Config {
@@ -19,8 +23,18 @@ impl Default for Config {
         Self {
             library_dirs: Vec::new(),
             default_volume: 70,
+            idle_timeout: default_idle_timeout(),
+            memory_on_move: default_memory_on_move(),
         }
     }
+}
+
+fn default_idle_timeout() -> String {
+    "30m".to_owned()
+}
+
+fn default_memory_on_move() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -63,6 +77,12 @@ pub struct ResumeStore {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BookmarkStore {
+    #[serde(default)]
+    pub files: BTreeMap<String, Vec<BookmarkEntry>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LibraryCache {
     #[serde(default)]
     pub entries: BTreeMap<String, CachedLibraryEntry>,
@@ -83,10 +103,19 @@ pub struct ResumeEntry {
     pub updated_at_epoch_seconds: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BookmarkEntry {
+    pub id: String,
+    pub position_seconds: f64,
+    pub label: String,
+    pub created_at_epoch_seconds: u64,
+}
+
 pub struct Storage {
     config_path: PathBuf,
     state_path: PathBuf,
     resume_path: PathBuf,
+    bookmarks_path: PathBuf,
     cache_path: PathBuf,
 }
 
@@ -102,6 +131,7 @@ impl Storage {
             config_path: config_root.join("config.toml"),
             state_path: state_root.join("state.toml"),
             resume_path: state_root.join("resume.toml"),
+            bookmarks_path: state_root.join("bookmarks.toml"),
             cache_path: state_root.join("library-cache.toml"),
         })
     }
@@ -130,6 +160,14 @@ impl Storage {
         save_toml(&self.resume_path, resume)
     }
 
+    pub fn load_bookmark_store(&self) -> Result<BookmarkStore> {
+        load_or_default(&self.bookmarks_path)
+    }
+
+    pub fn save_bookmark_store(&self, bookmarks: &BookmarkStore) -> Result<()> {
+        save_toml(&self.bookmarks_path, bookmarks)
+    }
+
     pub fn load_library_cache(&self) -> Result<LibraryCache> {
         load_or_default(&self.cache_path)
     }
@@ -144,6 +182,17 @@ pub fn canonical_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+pub fn media_key(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let size = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    format!("{name}::{size}")
 }
 
 pub fn duration_from_entry(entry: &ResumeEntry) -> Duration {
@@ -169,7 +218,7 @@ where
 
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?)
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn save_toml<T>(path: &Path, value: &T) -> Result<()>

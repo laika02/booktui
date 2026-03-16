@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode, LibraryRow};
+use crate::app::{App, InputMode, LibraryRow, ToastLevel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HitTarget {
@@ -26,7 +26,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_transport(frame, app, layout.transport);
     render_status(frame, app, layout.status);
 
-    if !matches!(app.input_mode, InputMode::Normal) {
+    if matches!(app.input_mode, InputMode::BookmarkList) {
+        render_bookmark_dialog(frame, app);
+    } else if matches!(app.input_mode, InputMode::ChapterList) {
+        render_chapter_dialog(frame, app);
+    } else if !matches!(app.input_mode, InputMode::Normal) {
         render_input_dialog(frame, app);
     }
 }
@@ -175,12 +179,12 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|snapshot| {
             if snapshot.is_paused {
-                "Timeline | Paused"
+                format!("Timeline | Paused | {}x", format_speed(snapshot.speed))
             } else {
-                "Timeline | Playing"
+                format!("Timeline | Playing | {}x", format_speed(snapshot.speed))
             }
         })
-        .unwrap_or("Timeline");
+        .unwrap_or_else(|| "Timeline".to_owned());
 
     let timeline = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title(timeline_title))
@@ -189,6 +193,8 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
         .label(timeline_label)
         .use_unicode(true);
     frame.render_widget(timeline, sections.timeline);
+    render_chapter_markers(frame, app, sections.timeline);
+    render_timeline_markers(frame, app, sections.timeline);
 
     let volume_value = snapshot
         .as_ref()
@@ -209,8 +215,14 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw("/ filter  "),
             Span::raw("s sort  "),
             Span::raw("e seek by  "),
+            Span::raw("t sleep  "),
+            Span::raw("b bookmark  "),
+            Span::raw("B bookmarks  "),
+            Span::raw("c/v chapter  "),
+            Span::raw("C chapters  "),
             Span::raw("u undo seek  "),
-            Span::raw("d drop root  "),
+            Span::raw("d untrack dir  "),
+            Span::raw("o/p speed  "),
             Span::raw("Enter play  "),
             Span::raw("Space pause  "),
             Span::raw("q quit"),
@@ -220,10 +232,11 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let style = if app.idle_paused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
+    let style = match app.status_level() {
+        ToastLevel::Info => Style::default(),
+        ToastLevel::Success => Style::default().fg(Color::Green),
+        ToastLevel::Warning => Style::default().fg(Color::Yellow),
+        ToastLevel::Error => Style::default().fg(Color::Red),
     };
 
     frame.render_widget(Paragraph::new(app.status_line()).style(style), area);
@@ -255,6 +268,91 @@ fn render_input_dialog(frame: &mut Frame, app: &App) {
     }
 }
 
+fn render_bookmark_dialog(frame: &mut Frame, app: &App) {
+    let popup = centered_rect(60, 12, frame.size());
+    frame.render_widget(Clear, popup);
+
+    let bookmarks = app.current_file_bookmarks();
+    let items: Vec<ListItem> = if bookmarks.is_empty() {
+        vec![ListItem::new("No bookmarks for this file.")]
+    } else {
+        bookmarks
+            .iter()
+            .map(|bookmark| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format_duration(bookmark.position),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw("  "),
+                    Span::raw(bookmark.label.clone()),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Bookmarks")
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    let mut state = app.bookmark_list_state.clone();
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_chapter_dialog(frame: &mut Frame, app: &App) {
+    let popup = centered_rect(60, 12, frame.size());
+    frame.render_widget(Clear, popup);
+
+    let chapters = app.current_chapters();
+    let items: Vec<ListItem> = if chapters.is_empty() {
+        vec![ListItem::new("No chapters for this file.")]
+    } else {
+        chapters
+            .iter()
+            .map(|chapter| {
+                let label = chapter.title.as_deref().unwrap_or("Untitled chapter");
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format_duration(chapter.position),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw("  "),
+                    Span::raw(label.to_owned()),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Chapters")
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    let mut state = app.chapter_list_state.clone();
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -281,6 +379,68 @@ fn ratio(position: Duration, duration: Duration) -> f64 {
     }
 
     (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+}
+
+fn render_timeline_markers(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(snapshot) = app.playback_snapshot() else {
+        return;
+    };
+    let Some(duration) = snapshot.duration else {
+        return;
+    };
+    let bookmarks = app.current_file_bookmarks();
+    if bookmarks.is_empty() || duration.is_zero() || area.width < 3 || area.height < 2 {
+        return;
+    }
+
+    let left = area.x.saturating_add(1);
+    let right = area.right().saturating_sub(2);
+    if right <= left {
+        return;
+    }
+
+    let y = area.y.saturating_add(1);
+    let buffer = frame.buffer_mut();
+    let span = (right - left) as f64;
+    for bookmark in bookmarks {
+        let ratio = (bookmark.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+        let x = left + (ratio * span).round() as u16;
+        buffer
+            .get_mut(x.min(right), y)
+            .set_symbol("│")
+            .set_fg(Color::Magenta);
+    }
+}
+
+fn render_chapter_markers(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(snapshot) = app.playback_snapshot() else {
+        return;
+    };
+    let Some(duration) = snapshot.duration else {
+        return;
+    };
+    let chapters = app.current_chapters();
+    if chapters.is_empty() || duration.is_zero() || area.width < 3 || area.height < 2 {
+        return;
+    }
+
+    let left = area.x.saturating_add(1);
+    let right = area.right().saturating_sub(2);
+    if right <= left {
+        return;
+    }
+
+    let y = area.y.saturating_add(1);
+    let buffer = frame.buffer_mut();
+    let span = (right - left) as f64;
+    for chapter in chapters {
+        let ratio = (chapter.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+        let x = left + (ratio * span).round() as u16;
+        buffer
+            .get_mut(x.min(right), y)
+            .set_symbol("┆")
+            .set_fg(Color::Yellow);
+    }
 }
 
 pub fn hit_test(area: Rect, column: u16, row: u16) -> Option<HitTarget> {
@@ -451,4 +611,15 @@ fn with_cursor(text: &str, cursor: usize) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn format_speed(speed: f32) -> String {
+    if (speed.fract()).abs() < f32::EPSILON {
+        format!("{speed:.0}")
+    } else {
+        format!("{speed:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
 }

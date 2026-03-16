@@ -14,19 +14,20 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, widgets::ListSt
 
 use crate::{
     library::{LibraryItem, scan_library},
-    player::{PlaybackSnapshot, Player},
+    player::{Chapter, PlaybackSnapshot, Player},
     storage::{
-        Config, LibraryCache, ResumeEntry, ResumeStore, SortMode, Storage, UiState, canonical_key,
-        duration_from_entry,
+        BookmarkEntry, BookmarkStore, Config, LibraryCache, ResumeEntry, ResumeStore, SortMode,
+        Storage, UiState, canonical_key, duration_from_entry, media_key,
     },
     ui::{self, HitTarget},
 };
 
 const TICK_RATE: Duration = Duration::from_millis(250);
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(60);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SEEK_STEP: Duration = Duration::from_secs(10);
 const VOLUME_STEP: u8 = 5;
+const TOAST_DURATION: Duration = Duration::from_secs(4);
+const SPEED_PRESETS: [f32; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMode {
@@ -34,6 +35,10 @@ pub enum InputMode {
     AddDirectory,
     Search,
     Seek,
+    Sleep,
+    BookmarkLabel,
+    BookmarkList,
+    ChapterList,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +53,27 @@ enum DragLock {
     Volume { area: Rect },
 }
 
+#[derive(Clone, Copy)]
+pub enum ToastLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+struct Toast {
+    message: String,
+    level: ToastLevel,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct BookmarkView {
+    pub id: String,
+    pub label: String,
+    pub position: Duration,
+}
+
 pub struct App {
     storage: Storage,
     config: Config,
@@ -60,14 +86,20 @@ pub struct App {
     pub input_cursor: usize,
     pub filter_query: String,
     pub idle_paused: bool,
-    status: String,
+    pub bookmark_list_state: ListState,
+    pub chapter_list_state: ListState,
+    toast: Option<Toast>,
     last_interaction_at: Instant,
     last_resume_save_at: Instant,
     resume_store: ResumeStore,
+    bookmark_store: BookmarkStore,
     library_cache: LibraryCache,
     drag_lock: Option<DragLock>,
     seek_undo_stack: Vec<Duration>,
     preview_seek_position: Option<Duration>,
+    idle_timeout: Duration,
+    sleep_timer_remaining: Option<Duration>,
+    last_sleep_tick_at: Instant,
 }
 
 impl App {
@@ -76,11 +108,14 @@ impl App {
         let config = storage.load_config()?;
         let ui_state = storage.load_ui_state()?;
         let resume_store = storage.load_resume_store()?;
+        let bookmark_store = storage.load_bookmark_store()?;
         let mut library_cache = storage.load_library_cache()?;
         let library_items = scan_library(&dirs_from_config(&config), &mut library_cache);
         storage.save_library_cache(&library_cache)?;
         let mut list_state = ListState::default();
         let player = Player::new(config.default_volume)?;
+        let idle_timeout = parse_duration_expr(&config.idle_timeout)
+            .unwrap_or_else(|| Duration::from_secs(30 * 60));
 
         let mut app = Self {
             player,
@@ -94,20 +129,33 @@ impl App {
             input_cursor: 0,
             filter_query: String::new(),
             idle_paused: false,
-            status: "Press 'a' to add a library directory.".to_owned(),
+            bookmark_list_state: ListState::default(),
+            chapter_list_state: ListState::default(),
+            toast: Some(Toast {
+                message: "Press 'a' to add a library directory.".to_owned(),
+                level: ToastLevel::Info,
+                expires_at: Instant::now() + TOAST_DURATION,
+            }),
             last_interaction_at: Instant::now(),
             last_resume_save_at: Instant::now(),
             resume_store,
+            bookmark_store,
             library_cache,
             drag_lock: None,
             seek_undo_stack: Vec::new(),
             preview_seek_position: None,
+            idle_timeout,
+            sleep_timer_remaining: None,
+            last_sleep_tick_at: Instant::now(),
         };
+
+        app.migrate_state_keys_if_needed()?;
 
         let selected = initial_selection(
             &app.library_items,
             app.sorted_filtered_indices(),
             app.ui_state.last_selected.as_deref(),
+            app.config.memory_on_move,
         );
         list_state.select(app.selectable_row_index_for_item(selected));
         app.list_state = list_state;
@@ -121,6 +169,8 @@ impl App {
         loop {
             self.refresh_playback_state()?;
             self.handle_idle_timeout()?;
+            self.handle_sleep_timer()?;
+            self.clear_expired_toast();
 
             terminal.draw(|frame| ui::render(frame, self))?;
 
@@ -218,16 +268,31 @@ impl App {
 
     pub fn status_line(&self) -> String {
         if self.idle_paused {
-            format!("{} Auto-resume is armed.", self.status)
-        } else {
-            self.status.clone()
+            return "Paused by idle timer. Any keypress resumes playback.".to_owned();
         }
+
+        if let Some(remaining) = self.sleep_remaining() {
+            return format!("Sleep timer: {}", ui::format_duration(remaining));
+        }
+
+        self.toast
+            .as_ref()
+            .map(|toast| toast.message.clone())
+            .unwrap_or_else(|| "Ready.".to_owned())
+    }
+
+    pub fn status_level(&self) -> ToastLevel {
+        if self.idle_paused {
+            return ToastLevel::Warning;
+        }
+        self.toast
+            .as_ref()
+            .map(|toast| toast.level)
+            .unwrap_or(ToastLevel::Info)
     }
 
     pub fn resume_label(&self, path: &Path) -> String {
-        self.resume_store
-            .positions
-            .get(&canonical_key(path))
+        self.resume_entry_for(path)
             .map(duration_from_entry)
             .map(ui::format_duration)
             .unwrap_or_else(|| "Start".to_owned())
@@ -251,6 +316,10 @@ impl App {
             InputMode::AddDirectory => "Add Directory",
             InputMode::Search => "Filter Library",
             InputMode::Seek => "Seek By",
+            InputMode::Sleep => "Sleep Timer",
+            InputMode::BookmarkLabel => "Add Bookmark",
+            InputMode::BookmarkList => "Bookmarks",
+            InputMode::ChapterList => "Chapters",
             InputMode::Normal => "",
         }
     }
@@ -260,8 +329,48 @@ impl App {
             InputMode::AddDirectory => "Type a path. Tab completes. Enter saves. Esc cancels.",
             InputMode::Search => "Type to filter. Enter keeps it. Esc clears and exits.",
             InputMode::Seek => "Examples: 1m, -1m, +30s, +1h2m3s. Enter applies.",
+            InputMode::Sleep => "Examples: 15m, 1h, 1h30m. Enter arms timer. Esc cancels.",
+            InputMode::BookmarkLabel => {
+                "Type a bookmark label. Leave empty to use the current timestamp."
+            }
+            InputMode::BookmarkList => "Enter jumps. d deletes. Esc closes.",
+            InputMode::ChapterList => "Enter jumps. Esc closes.",
             InputMode::Normal => "",
         }
+    }
+
+    pub fn current_file_bookmarks(&self) -> Vec<BookmarkView> {
+        let Some(path) = self.current_bookmark_path() else {
+            return Vec::new();
+        };
+        let Some(entries) = self.bookmark_store.files.get(&self.state_key(path)) else {
+            return Vec::new();
+        };
+
+        let mut bookmarks: Vec<BookmarkView> = entries
+            .iter()
+            .map(|entry| BookmarkView {
+                id: entry.id.clone(),
+                label: entry.label.clone(),
+                position: Duration::from_secs_f64(entry.position_seconds.max(0.0)),
+            })
+            .collect();
+        bookmarks.sort_by_key(|entry| entry.position);
+        bookmarks
+    }
+
+    pub fn selected_bookmark(&self) -> Option<BookmarkView> {
+        let index = self.bookmark_list_state.selected()?;
+        self.current_file_bookmarks().get(index).cloned()
+    }
+
+    pub fn current_chapters(&self) -> &[Chapter] {
+        self.player.chapters()
+    }
+
+    pub fn selected_chapter(&self) -> Option<Chapter> {
+        let index = self.chapter_list_state.selected()?;
+        self.player.chapters().get(index).cloned()
     }
 
     pub fn selected_root(&self) -> Option<&str> {
@@ -295,6 +404,10 @@ impl App {
             InputMode::AddDirectory => self.handle_add_directory_mode(key),
             InputMode::Search => self.handle_search_mode(key),
             InputMode::Seek => self.handle_seek_mode(key),
+            InputMode::Sleep => self.handle_sleep_mode(key),
+            InputMode::BookmarkLabel => self.handle_bookmark_label_mode(key),
+            InputMode::BookmarkList => self.handle_bookmark_list_mode(key),
+            InputMode::ChapterList => self.handle_chapter_list_mode(key),
         }
     }
 
@@ -304,10 +417,18 @@ impl App {
             KeyCode::Char('a') => self.begin_input(InputMode::AddDirectory, String::new()),
             KeyCode::Char('/') => self.begin_input(InputMode::Search, self.filter_query.clone()),
             KeyCode::Char('e') => self.begin_input(InputMode::Seek, String::new()),
+            KeyCode::Char('t') => self.begin_input(InputMode::Sleep, String::new()),
+            KeyCode::Char('b') => self.begin_add_bookmark(),
+            KeyCode::Char('B') => self.open_bookmark_list(),
+            KeyCode::Char('c') => self.seek_chapter(false)?,
+            KeyCode::Char('v') => self.seek_chapter(true)?,
+            KeyCode::Char('C') => self.open_chapter_list(),
             KeyCode::Char('u') => self.undo_last_seek()?,
             KeyCode::Char('r') => self.rescan_library()?,
             KeyCode::Char('d') => self.remove_selected_root()?,
             KeyCode::Char('s') => self.cycle_sort_mode()?,
+            KeyCode::Char('o') => self.adjust_speed(false),
+            KeyCode::Char('p') => self.adjust_speed(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -343,7 +464,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
-                self.status = "Directory entry canceled.".to_owned();
+                self.set_toast("Directory entry canceled.", ToastLevel::Info);
             }
             KeyCode::Enter => {
                 self.commit_directory()?;
@@ -369,16 +490,19 @@ impl App {
                 self.input_cursor = 0;
                 self.input_mode = InputMode::Normal;
                 self.refresh_selection_after_structure_change(None);
-                self.status = "Library filter cleared.".to_owned();
+                self.set_toast("Library filter cleared.", ToastLevel::Info);
             }
             KeyCode::Enter => {
                 self.apply_filter_from_input();
                 self.input_mode = InputMode::Normal;
-                self.status = if self.filter_query.is_empty() {
-                    "Library filter cleared.".to_owned()
+                if self.filter_query.is_empty() {
+                    self.set_toast("Library filter cleared.", ToastLevel::Info);
                 } else {
-                    format!("Filtering library by '{}'.", self.filter_query)
-                };
+                    self.set_toast(
+                        &format!("Filtering library by '{}'.", self.filter_query),
+                        ToastLevel::Info,
+                    );
+                }
             }
             _ => {}
         }
@@ -394,10 +518,87 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
-                self.status = "Seek canceled.".to_owned();
+                self.set_toast("Seek canceled.", ToastLevel::Info);
             }
             KeyCode::Enter => {
                 self.apply_seek_input()?;
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_sleep_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.handle_shared_input_key(key)? {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_toast("Sleep timer canceled.", ToastLevel::Info);
+            }
+            KeyCode::Enter => {
+                self.apply_sleep_input();
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_bookmark_label_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.handle_shared_input_key(key)? {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_toast("Bookmark creation canceled.", ToastLevel::Info);
+            }
+            KeyCode::Enter => {
+                self.commit_bookmark()?;
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_bookmark_list_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_toast("Closed bookmarks.", ToastLevel::Info);
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_bookmark_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_bookmark_selection(1),
+            KeyCode::Enter => {
+                self.jump_to_selected_bookmark()?;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('d') => self.delete_selected_bookmark()?,
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_chapter_list_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_toast("Closed chapters.", ToastLevel::Info);
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_chapter_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_chapter_selection(1),
+            KeyCode::Enter => {
+                self.jump_to_selected_chapter()?;
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -411,34 +612,41 @@ impl App {
         if self.idle_paused {
             self.player.resume()?;
             self.idle_paused = false;
-            self.status = "Playback resumed after idle timeout.".to_owned();
+            self.set_toast("Playback resumed after idle timeout.", ToastLevel::Info);
         }
         Ok(())
     }
 
     fn play_selected(&mut self) -> Result<()> {
         let Some(item) = self.selected_item().cloned() else {
-            self.status = "No audiobook selected.".to_owned();
+            self.set_toast("No audiobook selected.", ToastLevel::Warning);
             return Ok(());
         };
 
         let start_at = self
-            .resume_store
-            .positions
-            .get(&canonical_key(item.path.as_path()))
+            .resume_entry_for(item.path.as_path())
             .map(duration_from_entry)
             .unwrap_or(Duration::ZERO);
 
-        self.player.load(item.path.as_path(), start_at)?;
-        self.last_resume_save_at = Instant::now();
-        self.status = format!("Playing {}", item.title);
+        match self.player.load(item.path.as_path(), start_at) {
+            Ok(()) => {
+                self.last_resume_save_at = Instant::now();
+                self.set_toast(&format!("Playing {}", item.title), ToastLevel::Success);
+            }
+            Err(error) => {
+                self.set_toast(
+                    &format!("Failed to play {}: {}", item.title, error),
+                    ToastLevel::Error,
+                );
+            }
+        }
         Ok(())
     }
 
     fn refresh_playback_state(&mut self) -> Result<()> {
         if let Some(path) = self.player.tick()? {
             self.save_resume_for_path(path.as_path(), Duration::ZERO)?;
-            self.status = format!("Finished {}", path.display());
+            self.set_toast(&format!("Finished {}", path.display()), ToastLevel::Info);
             self.idle_paused = false;
         }
         Ok(())
@@ -447,12 +655,34 @@ impl App {
     fn handle_idle_timeout(&mut self) -> Result<()> {
         if self.player.is_playing()
             && !self.player.is_paused()
-            && self.last_interaction_at.elapsed() >= IDLE_TIMEOUT
+            && self.last_interaction_at.elapsed() >= self.idle_timeout
         {
             self.player.pause()?;
             self.persist_current_resume()?;
             self.idle_paused = true;
-            self.status = "Paused after 30 minutes without input.".to_owned();
+            self.set_toast("Paused by idle timeout.", ToastLevel::Warning);
+        }
+        Ok(())
+    }
+
+    fn handle_sleep_timer(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_sleep_tick_at);
+        self.last_sleep_tick_at = now;
+
+        if !self.player.is_playing() || self.player.is_paused() {
+            return Ok(());
+        }
+
+        if let Some(remaining) = self.sleep_timer_remaining {
+            if elapsed >= remaining {
+                self.player.pause()?;
+                self.persist_current_resume()?;
+                self.sleep_timer_remaining = None;
+                self.set_toast("Paused by sleep timer.", ToastLevel::Warning);
+            } else {
+                self.sleep_timer_remaining = Some(remaining - elapsed);
+            }
         }
         Ok(())
     }
@@ -461,7 +691,57 @@ impl App {
         self.input_mode = mode;
         self.input_buffer = initial;
         self.input_cursor = self.input_buffer.len();
-        self.status.clear();
+        self.toast = None;
+    }
+
+    fn begin_add_bookmark(&mut self) {
+        if self.player.current_file().is_none() {
+            self.set_toast(
+                "Start playback before adding a bookmark.",
+                ToastLevel::Warning,
+            );
+            return;
+        }
+        self.begin_input(InputMode::BookmarkLabel, String::new());
+    }
+
+    fn open_bookmark_list(&mut self) {
+        if self.player.current_file().is_none() {
+            self.set_toast(
+                "Start playback before opening bookmarks.",
+                ToastLevel::Warning,
+            );
+            return;
+        }
+
+        let bookmarks = self.current_file_bookmarks();
+        if bookmarks.is_empty() {
+            self.set_toast("No bookmarks for the current file.", ToastLevel::Info);
+            return;
+        }
+
+        self.bookmark_list_state.select(Some(0));
+        self.input_mode = InputMode::BookmarkList;
+        self.toast = None;
+    }
+
+    fn open_chapter_list(&mut self) {
+        if self.player.current_file().is_none() {
+            self.set_toast(
+                "Start playback before opening chapters.",
+                ToastLevel::Warning,
+            );
+            return;
+        }
+
+        if self.player.chapters().is_empty() {
+            self.set_toast("No chapters for the current file.", ToastLevel::Info);
+            return;
+        }
+
+        self.chapter_list_state.select(Some(0));
+        self.input_mode = InputMode::ChapterList;
+        self.toast = None;
     }
 
     fn handle_shared_input_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -528,13 +808,16 @@ impl App {
     fn commit_directory(&mut self) -> Result<()> {
         let input = self.input_buffer.trim();
         if input.is_empty() {
-            self.status = "Directory path is empty.".to_owned();
+            self.set_toast("Directory path is empty.", ToastLevel::Warning);
             return Ok(());
         }
 
         let path = expand_tilde(input);
         if !path.is_dir() {
-            self.status = format!("Not a directory: {}", path.display());
+            self.set_toast(
+                &format!("Not a directory: {}", path.display()),
+                ToastLevel::Warning,
+            );
             return Ok(());
         }
 
@@ -549,7 +832,10 @@ impl App {
             .iter()
             .any(|entry| entry == &canonical_str)
         {
-            self.status = "Directory already exists in the library.".to_owned();
+            self.set_toast(
+                "Directory already exists in the library.",
+                ToastLevel::Warning,
+            );
             return Ok(());
         }
 
@@ -557,7 +843,10 @@ impl App {
         self.config.library_dirs.sort();
         self.storage.save_config(&self.config)?;
         self.rescan_library()?;
-        self.status = format!("Added {}", canonical.display());
+        self.set_toast(
+            &format!("Added {}", canonical.display()),
+            ToastLevel::Success,
+        );
         self.input_buffer.clear();
         self.input_cursor = 0;
         Ok(())
@@ -585,7 +874,10 @@ impl App {
         let entries = match fs::read_dir(&search_dir) {
             Ok(entries) => entries,
             Err(_) => {
-                self.status = format!("Cannot read {}", search_dir.display());
+                self.set_toast(
+                    &format!("Cannot read {}", search_dir.display()),
+                    ToastLevel::Warning,
+                );
                 return Ok(());
             }
         };
@@ -605,7 +897,7 @@ impl App {
         matches.sort();
 
         if matches.is_empty() {
-            self.status = "No matching directories.".to_owned();
+            self.set_toast("No matching directories.", ToastLevel::Info);
             return Ok(());
         }
 
@@ -614,7 +906,10 @@ impl App {
         } else {
             let common = longest_common_prefix(&matches);
             if common.as_os_str().is_empty() {
-                self.status = format!("{} directory matches.", matches.len());
+                self.set_toast(
+                    &format!("{} directory matches.", matches.len()),
+                    ToastLevel::Info,
+                );
                 return Ok(());
             }
             common
@@ -622,18 +917,21 @@ impl App {
 
         self.input_buffer = display_input_path(&new_path);
         self.input_cursor = self.input_buffer.len();
-        self.status = if matches.len() == 1 {
-            format!("Completed {}", self.input_buffer)
+        if matches.len() == 1 {
+            self.set_toast(
+                &format!("Completed {}", self.input_buffer),
+                ToastLevel::Info,
+            );
         } else {
-            format!("{} matches", matches.len())
-        };
+            self.set_toast(&format!("{} matches", matches.len()), ToastLevel::Info);
+        }
         Ok(())
     }
 
     fn apply_filter_from_input(&mut self) {
         let selected = self
             .selected_item()
-            .map(|item| canonical_key(item.path.as_path()));
+            .map(|item| self.state_key(item.path.as_path()));
         self.filter_query = self.input_buffer.trim().to_owned();
         self.refresh_selection_after_structure_change(selected.as_deref());
     }
@@ -641,40 +939,52 @@ impl App {
     fn rescan_library(&mut self) -> Result<()> {
         let selected = self
             .selected_item()
-            .map(|item| canonical_key(item.path.as_path()));
+            .map(|item| self.state_key(item.path.as_path()));
         self.library_items = scan_library(&dirs_from_config(&self.config), &mut self.library_cache);
         self.storage.save_library_cache(&self.library_cache)?;
         self.refresh_selection_after_structure_change(selected.as_deref());
         self.persist_ui_state()?;
-        self.status = format!(
-            "Scanned {} audiobook files across {} roots.",
-            self.library_items.len(),
-            self.config.library_dirs.len()
+        self.set_toast(
+            &format!(
+                "Scanned {} audiobook files across {} roots.",
+                self.library_items.len(),
+                self.config.library_dirs.len()
+            ),
+            ToastLevel::Success,
         );
         Ok(())
     }
 
     fn remove_selected_root(&mut self) -> Result<()> {
         let Some(root) = self.selected_root().map(str::to_owned) else {
-            self.status = "Select a file to remove its library root.".to_owned();
+            self.set_toast(
+                "Select a file to untrack its library directory.",
+                ToastLevel::Warning,
+            );
             return Ok(());
         };
 
         self.config.library_dirs.retain(|entry| entry != &root);
         self.storage.save_config(&self.config)?;
         self.rescan_library()?;
-        self.status = format!("Removed root {}", root);
+        self.set_toast(
+            &format!("Untracked directory {}", root),
+            ToastLevel::Success,
+        );
         Ok(())
     }
 
     fn cycle_sort_mode(&mut self) -> Result<()> {
         let selected = self
             .selected_item()
-            .map(|item| canonical_key(item.path.as_path()));
+            .map(|item| self.state_key(item.path.as_path()));
         self.ui_state.sort_mode = self.ui_state.sort_mode.next();
         self.storage.save_ui_state(&self.ui_state)?;
         self.refresh_selection_after_structure_change(selected.as_deref());
-        self.status = format!("Sort mode: {}", self.ui_state.sort_mode.label());
+        self.set_toast(
+            &format!("Sort mode: {}", self.ui_state.sort_mode.label()),
+            ToastLevel::Info,
+        );
         Ok(())
     }
 
@@ -719,7 +1029,10 @@ impl App {
 
     fn apply_seek_input(&mut self) -> Result<()> {
         let Some(parsed) = parse_seek_spec(self.input_buffer.trim()) else {
-            self.status = "Invalid seek. Use forms like 1m, -30s, +1h2m3s.".to_owned();
+            self.set_toast(
+                "Invalid seek. Use forms like 1m, -30s, +1h2m3s.",
+                ToastLevel::Error,
+            );
             return Ok(());
         };
 
@@ -733,7 +1046,63 @@ impl App {
         self.capture_seek_undo();
         self.player.seek_to(target)?;
         self.persist_current_resume()?;
-        self.status = format!("Seeked to {}", ui::format_duration(target));
+        self.set_toast(
+            &format!("Seeked to {}", ui::format_duration(target)),
+            ToastLevel::Success,
+        );
+        Ok(())
+    }
+
+    fn apply_sleep_input(&mut self) {
+        let Some(duration) = parse_duration_expr(self.input_buffer.trim()) else {
+            self.set_toast(
+                "Invalid sleep timer. Use forms like 15m or 1h30m.",
+                ToastLevel::Error,
+            );
+            return;
+        };
+        if duration.is_zero() {
+            self.set_toast(
+                "Sleep timer must be greater than zero.",
+                ToastLevel::Warning,
+            );
+            return;
+        }
+        self.sleep_timer_remaining = Some(duration);
+        self.last_sleep_tick_at = Instant::now();
+        self.set_toast(
+            &format!("Sleep timer set for {}", ui::format_duration(duration)),
+            ToastLevel::Success,
+        );
+    }
+
+    fn commit_bookmark(&mut self) -> Result<()> {
+        let Some(path) = self.player.current_file().map(Path::to_path_buf) else {
+            self.set_toast("No active file for bookmark.", ToastLevel::Warning);
+            return Ok(());
+        };
+
+        let position = self.player.current_position();
+        let key = self.state_key(path.as_path());
+        let created_at = unix_epoch_now();
+        let label = if self.input_buffer.trim().is_empty() {
+            ui::format_duration(position)
+        } else {
+            self.input_buffer.trim().to_owned()
+        };
+
+        let entries = self.bookmark_store.files.entry(key).or_default();
+        entries.push(BookmarkEntry {
+            id: format!("bk-{created_at}-{}", entries.len()),
+            position_seconds: position.as_secs_f64(),
+            label: label.clone(),
+            created_at_epoch_seconds: created_at,
+        });
+        entries.sort_by(|left, right| left.position_seconds.total_cmp(&right.position_seconds));
+        self.storage.save_bookmark_store(&self.bookmark_store)?;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.set_toast(&format!("Saved bookmark '{}'.", label), ToastLevel::Success);
         Ok(())
     }
 
@@ -757,7 +1126,7 @@ impl App {
                 let ratio = ui::ratio_from_gauge_click(area, column);
                 let target = Duration::from_secs_f64(duration.as_secs_f64() * ratio);
                 self.preview_seek_position = Some(target);
-                self.status = format!("Preview seek {}", ui::format_duration(target));
+                self.toast = None;
             }
             Some(DragLock::Volume { area }) => {
                 self.drag_lock = Some(DragLock::Volume { area });
@@ -771,11 +1140,14 @@ impl App {
     }
 
     fn handle_mouse_up(&mut self) {
-        if let Some(target) = self.preview_seek_position.take() {
-            if self.player.seek_to(target).is_ok() {
-                let _ = self.persist_current_resume();
-                self.status = format!("Seeked to {}", ui::format_duration(target));
-            }
+        if let Some(target) = self.preview_seek_position.take()
+            && self.player.seek_to(target).is_ok()
+        {
+            let _ = self.persist_current_resume();
+            self.set_toast(
+                &format!("Seeked to {}", ui::format_duration(target)),
+                ToastLevel::Success,
+            );
         }
         self.drag_lock = None;
     }
@@ -792,19 +1164,205 @@ impl App {
 
     fn undo_last_seek(&mut self) -> Result<()> {
         let Some(target) = self.seek_undo_stack.pop() else {
-            self.status = "No seek to undo.".to_owned();
+            self.set_toast("No seek to undo.", ToastLevel::Warning);
             return Ok(());
         };
         self.player.seek_to(target)?;
         self.persist_current_resume()?;
-        self.status = format!("Undid seek to {}", ui::format_duration(target));
+        self.set_toast(
+            &format!("Undid seek to {}", ui::format_duration(target)),
+            ToastLevel::Success,
+        );
         Ok(())
+    }
+
+    fn move_bookmark_selection(&mut self, delta: isize) {
+        let bookmarks = self.current_file_bookmarks();
+        if bookmarks.is_empty() {
+            self.bookmark_list_state.select(None);
+            return;
+        }
+
+        let current = self.bookmark_list_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, (bookmarks.len() - 1) as isize) as usize;
+        self.bookmark_list_state.select(Some(next));
+    }
+
+    fn move_chapter_selection(&mut self, delta: isize) {
+        let chapters = self.player.chapters();
+        if chapters.is_empty() {
+            self.chapter_list_state.select(None);
+            return;
+        }
+
+        let current = self.chapter_list_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, (chapters.len() - 1) as isize) as usize;
+        self.chapter_list_state.select(Some(next));
+    }
+
+    fn jump_to_selected_bookmark(&mut self) -> Result<()> {
+        let Some(bookmark) = self.selected_bookmark() else {
+            self.set_toast("No bookmark selected.", ToastLevel::Warning);
+            return Ok(());
+        };
+
+        self.capture_seek_undo();
+        self.player.seek_to(bookmark.position)?;
+        self.persist_current_resume()?;
+        self.set_toast(
+            &format!("Jumped to bookmark '{}'.", bookmark.label),
+            ToastLevel::Success,
+        );
+        Ok(())
+    }
+
+    fn delete_selected_bookmark(&mut self) -> Result<()> {
+        let Some(path) = self.current_bookmark_path().map(Path::to_path_buf) else {
+            self.set_toast("No active file for bookmarks.", ToastLevel::Warning);
+            return Ok(());
+        };
+        let Some(bookmark) = self.selected_bookmark() else {
+            self.set_toast("No bookmark selected.", ToastLevel::Warning);
+            return Ok(());
+        };
+
+        let key = self.state_key(path.as_path());
+        if let Some(entries) = self.bookmark_store.files.get_mut(&key) {
+            entries.retain(|entry| entry.id != bookmark.id);
+            if entries.is_empty() {
+                self.bookmark_store.files.remove(&key);
+            }
+            self.storage.save_bookmark_store(&self.bookmark_store)?;
+        }
+
+        let remaining = self.current_file_bookmarks().len();
+        if remaining == 0 {
+            self.bookmark_list_state.select(None);
+            self.input_mode = InputMode::Normal;
+        } else {
+            let selected = self
+                .bookmark_list_state
+                .selected()
+                .unwrap_or(0)
+                .min(remaining - 1);
+            self.bookmark_list_state.select(Some(selected));
+        }
+        self.set_toast(
+            &format!("Deleted bookmark '{}'.", bookmark.label),
+            ToastLevel::Success,
+        );
+        Ok(())
+    }
+
+    fn seek_chapter(&mut self, forward: bool) -> Result<()> {
+        if self.player.chapters().is_empty() {
+            self.set_toast("No chapters for the current file.", ToastLevel::Info);
+            return Ok(());
+        }
+
+        let current = self.player.current_position();
+        let target = if forward {
+            self.player
+                .chapters()
+                .iter()
+                .find(|chapter| chapter.position > current.saturating_add(Duration::from_secs(1)))
+                .cloned()
+        } else {
+            self.player
+                .chapters()
+                .iter()
+                .rev()
+                .find(|chapter| chapter.position.saturating_add(Duration::from_secs(1)) < current)
+                .cloned()
+        };
+
+        let Some(chapter) = target else {
+            self.set_toast("No more chapters in that direction.", ToastLevel::Info);
+            return Ok(());
+        };
+
+        self.capture_seek_undo();
+        self.player.seek_to(chapter.position)?;
+        self.persist_current_resume()?;
+        let label = chapter.title.as_deref().unwrap_or("chapter");
+        self.set_toast(
+            &format!(
+                "Jumped to {} at {}.",
+                label,
+                ui::format_duration(chapter.position)
+            ),
+            ToastLevel::Success,
+        );
+        Ok(())
+    }
+
+    fn jump_to_selected_chapter(&mut self) -> Result<()> {
+        let Some(chapter) = self.selected_chapter() else {
+            self.set_toast("No chapter selected.", ToastLevel::Warning);
+            return Ok(());
+        };
+
+        self.capture_seek_undo();
+        self.player.seek_to(chapter.position)?;
+        self.persist_current_resume()?;
+        let label = chapter.title.as_deref().unwrap_or("chapter");
+        self.set_toast(
+            &format!(
+                "Jumped to {} at {}.",
+                label,
+                ui::format_duration(chapter.position)
+            ),
+            ToastLevel::Success,
+        );
+        Ok(())
+    }
+
+    fn adjust_speed(&mut self, increase: bool) {
+        let current = self.player.speed();
+        let current_index = SPEED_PRESETS
+            .iter()
+            .position(|preset| (*preset - current).abs() < f32::EPSILON)
+            .unwrap_or(2);
+        let next_index = if increase {
+            (current_index + 1).min(SPEED_PRESETS.len() - 1)
+        } else {
+            current_index.saturating_sub(1)
+        };
+        let next = SPEED_PRESETS[next_index];
+        self.player.set_speed(next);
+        self.set_toast(
+            &format!("Speed set to {}x", format_speed(next)),
+            ToastLevel::Info,
+        );
+    }
+
+    fn set_toast(&mut self, message: &str, level: ToastLevel) {
+        self.toast = Some(Toast {
+            message: message.to_owned(),
+            level,
+            expires_at: Instant::now() + TOAST_DURATION,
+        });
+    }
+
+    fn clear_expired_toast(&mut self) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Instant::now() >= toast.expires_at)
+        {
+            self.toast = None;
+        }
+    }
+
+    fn sleep_remaining(&self) -> Option<Duration> {
+        self.sleep_timer_remaining
+            .filter(|remaining| !remaining.is_zero())
     }
 
     fn persist_ui_state(&mut self) -> Result<()> {
         self.ui_state.last_selected = self
             .selected_item()
-            .map(|item| canonical_key(item.path.as_path()));
+            .map(|item| self.state_key(item.path.as_path()));
         self.storage.save_ui_state(&self.ui_state)
     }
 
@@ -819,7 +1377,12 @@ impl App {
     }
 
     fn save_resume_for_path(&mut self, path: &Path, position: Duration) -> Result<()> {
-        let key = canonical_key(path);
+        let key = self.state_key(path);
+        if self.config.memory_on_move {
+            self.resume_store.positions.remove(&canonical_key(path));
+        } else {
+            self.resume_store.positions.remove(&media_key(path));
+        }
         self.resume_store.positions.insert(
             key,
             ResumeEntry {
@@ -831,10 +1394,7 @@ impl App {
     }
 
     fn resume_duration_for(&self, path: &Path) -> Option<Duration> {
-        self.resume_store
-            .positions
-            .get(&canonical_key(path))
-            .map(duration_from_entry)
+        self.resume_entry_for(path).map(duration_from_entry)
     }
 
     fn sorted_filtered_indices(&self) -> Vec<usize> {
@@ -870,9 +1430,7 @@ impl App {
             SortMode::LastPlayed => indices.sort_by_key(|index| {
                 let item = &self.library_items[*index];
                 let last = self
-                    .resume_store
-                    .positions
-                    .get(&canonical_key(item.path.as_path()))
+                    .resume_entry_for(item.path.as_path())
                     .map(|entry| entry.updated_at_epoch_seconds)
                     .unwrap_or(0);
                 (
@@ -927,14 +1485,94 @@ impl App {
 
     fn refresh_selection_after_structure_change(&mut self, selected_key: Option<&str>) {
         let target_item = selected_key.and_then(|key| {
-            self.sorted_filtered_indices()
-                .into_iter()
-                .find(|index| canonical_key(self.library_items[*index].path.as_path()) == key)
+            self.sorted_filtered_indices().into_iter().find(|index| {
+                self.state_key_matches(self.library_items[*index].path.as_path(), key)
+            })
         });
         self.list_state.select(
             self.selectable_row_index_for_item(target_item)
                 .or_else(|| self.selectable_row_indices().first().copied()),
         );
+    }
+
+    fn resume_entry_for(&self, path: &Path) -> Option<&ResumeEntry> {
+        if self.config.memory_on_move {
+            self.resume_store
+                .positions
+                .get(&media_key(path))
+                .or_else(|| self.resume_store.positions.get(&canonical_key(path)))
+        } else {
+            self.resume_store.positions.get(&canonical_key(path))
+        }
+    }
+
+    fn state_key(&self, path: &Path) -> String {
+        if self.config.memory_on_move {
+            media_key(path)
+        } else {
+            canonical_key(path)
+        }
+    }
+
+    fn state_key_matches(&self, path: &Path, saved_key: &str) -> bool {
+        state_key_matches(path, saved_key, self.config.memory_on_move)
+    }
+
+    fn current_bookmark_path(&self) -> Option<&Path> {
+        self.player
+            .current_file()
+            .or_else(|| self.selected_item().map(|item| item.path.as_path()))
+    }
+
+    fn migrate_state_keys_if_needed(&mut self) -> Result<()> {
+        if self.config.memory_on_move {
+            return Ok(());
+        }
+
+        let mut resume_changed = false;
+        let mut bookmark_changed = false;
+        for item in &self.library_items {
+            let media = media_key(item.path.as_path());
+            let canonical = canonical_key(item.path.as_path());
+            if let Some(entry) = self.resume_store.positions.remove(&media) {
+                if !self.resume_store.positions.contains_key(&canonical) {
+                    self.resume_store.positions.insert(canonical.clone(), entry);
+                }
+                resume_changed = true;
+            }
+            if let Some(entries) = self.bookmark_store.files.remove(&media) {
+                self.bookmark_store
+                    .files
+                    .entry(canonical)
+                    .or_default()
+                    .extend(entries);
+                bookmark_changed = true;
+            }
+        }
+
+        if resume_changed {
+            self.storage.save_resume_store(&self.resume_store)?;
+        }
+        if bookmark_changed {
+            for entries in self.bookmark_store.files.values_mut() {
+                entries.sort_by(|left, right| {
+                    left.position_seconds.total_cmp(&right.position_seconds)
+                });
+            }
+            self.storage.save_bookmark_store(&self.bookmark_store)?;
+        }
+
+        if let Some(saved) = self.ui_state.last_selected.clone() {
+            for item in &self.library_items {
+                if media_key(item.path.as_path()) == saved {
+                    self.ui_state.last_selected = Some(canonical_key(item.path.as_path()));
+                    self.storage.save_ui_state(&self.ui_state)?;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn delete_prev_char(&mut self) {
@@ -977,15 +1615,24 @@ fn initial_selection(
     items: &[LibraryItem],
     indices: Vec<usize>,
     selected_path: Option<&str>,
+    memory_on_move: bool,
 ) -> Option<usize> {
     selected_path
         .and_then(|path| {
             indices
                 .iter()
                 .copied()
-                .find(|index| canonical_key(items[*index].path.as_path()) == path)
+                .find(|index| state_key_matches(items[*index].path.as_path(), path, memory_on_move))
         })
         .or_else(|| indices.first().copied())
+}
+
+fn state_key_matches(path: &Path, saved_key: &str, memory_on_move: bool) -> bool {
+    if memory_on_move {
+        media_key(path) == saved_key || canonical_key(path) == saved_key
+    } else {
+        canonical_key(path) == saved_key
+    }
 }
 
 fn unix_epoch_now() -> u64 {
@@ -999,10 +1646,10 @@ fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from(input));
     }
-    if let Some(stripped) = input.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(stripped);
-        }
+    if let Some(stripped) = input.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(stripped);
     }
     PathBuf::from(input)
 }
@@ -1149,4 +1796,15 @@ fn parse_duration_expr(input: &str) -> Option<Duration> {
     }
 
     saw_unit.then(|| Duration::from_secs(total_seconds))
+}
+
+fn format_speed(speed: f32) -> String {
+    if (speed.fract()).abs() < f32::EPSILON {
+        format!("{speed:.0}")
+    } else {
+        format!("{speed:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
 }
