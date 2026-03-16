@@ -1,0 +1,17 @@
+[package]
+name = "booktui"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal audiobook player built with ratatui, crossterm, and rodio"
+readme = "README.md"
+keywords = ["audiobook", "tui", "terminal", "ratatui", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.102"
+crossterm = "0.27.0"
+ratatui = "0.26.3"
+rodio = "0.22.2"
+serde = { version = "1.0.228", features = ["derive"] }
+symphonia = { version = "0.5.5", features = ["mp3", "isomp4"] }
+toml = "0.9.12"
