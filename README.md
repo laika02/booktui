@@ -44,6 +44,14 @@ If dependencies are not cached locally yet:
 cargo run
 ```
 
+Run a prebuilt release binary:
+
+```bash
+./booktui
+```
+
+If you are publishing releases on GitHub, attaching the compiled Linux binary lets users run the app without installing the Rust toolchain.
+
 ## Controls
 
 - `a`: add library directory
