@@ -95,6 +95,8 @@ pub struct CachedLibraryEntry {
     pub extension: String,
     pub parent_label: String,
     pub modified_epoch_seconds: u64,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -100,6 +100,7 @@ pub struct App {
     idle_timeout: Duration,
     sleep_timer_remaining: Option<Duration>,
     last_sleep_tick_at: Instant,
+    pending_bookmark_position: Option<Duration>,
 }
 
 impl App {
@@ -147,6 +148,7 @@ impl App {
             idle_timeout,
             sleep_timer_remaining: None,
             last_sleep_tick_at: Instant::now(),
+            pending_bookmark_position: None,
         };
 
         app.migrate_state_keys_if_needed()?;
@@ -260,10 +262,16 @@ impl App {
     }
 
     pub fn current_duration(&self) -> Option<Duration> {
-        self.player.duration().or_else(|| {
-            self.selected_item()
-                .and_then(|item| self.resume_duration_for(item.path.as_path()))
-        })
+        let selected = self.selected_item()?;
+        if self
+            .player
+            .current_file()
+            .is_some_and(|current| current == selected.path.as_path())
+        {
+            self.player.duration().or(selected.duration)
+        } else {
+            selected.duration
+        }
     }
 
     pub fn status_line(&self) -> String {
@@ -558,6 +566,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+                self.pending_bookmark_position = None;
                 self.set_toast("Bookmark creation canceled.", ToastLevel::Info);
             }
             KeyCode::Enter => {
@@ -702,6 +711,7 @@ impl App {
             );
             return;
         }
+        self.pending_bookmark_position = Some(self.player.current_position());
         self.begin_input(InputMode::BookmarkLabel, String::new());
     }
 
@@ -1082,7 +1092,9 @@ impl App {
             return Ok(());
         };
 
-        let position = self.player.current_position();
+        let position = self
+            .pending_bookmark_position
+            .unwrap_or_else(|| self.player.current_position());
         let key = self.state_key(path.as_path());
         let created_at = unix_epoch_now();
         let label = if self.input_buffer.trim().is_empty() {
@@ -1102,6 +1114,7 @@ impl App {
         self.storage.save_bookmark_store(&self.bookmark_store)?;
         self.input_buffer.clear();
         self.input_cursor = 0;
+        self.pending_bookmark_position = None;
         self.set_toast(&format!("Saved bookmark '{}'.", label), ToastLevel::Success);
         Ok(())
     }
@@ -1391,10 +1404,6 @@ impl App {
             },
         );
         self.storage.save_resume_store(&self.resume_store)
-    }
-
-    fn resume_duration_for(&self, path: &Path) -> Option<Duration> {
-        self.resume_entry_for(path).map(duration_from_entry)
     }
 
     fn sorted_filtered_indices(&self) -> Vec<usize> {

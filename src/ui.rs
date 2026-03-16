@@ -190,11 +190,11 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(timeline_title))
         .gauge_style(Style::default().fg(Color::Cyan))
         .ratio(timeline_ratio)
-        .label(timeline_label)
+        .label(timeline_label.as_str())
         .use_unicode(true);
     frame.render_widget(timeline, sections.timeline);
-    render_chapter_markers(frame, app, sections.timeline);
-    render_timeline_markers(frame, app, sections.timeline);
+    render_chapter_markers(frame, app, sections.timeline, &timeline_label);
+    render_timeline_markers(frame, app, sections.timeline, &timeline_label);
 
     let volume_value = snapshot
         .as_ref()
@@ -381,7 +381,7 @@ fn ratio(position: Duration, duration: Duration) -> f64 {
     (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
 }
 
-fn render_timeline_markers(frame: &mut Frame, app: &App, area: Rect) {
+fn render_timeline_markers(frame: &mut Frame, app: &App, area: Rect, label: &str) {
     let Some(snapshot) = app.playback_snapshot() else {
         return;
     };
@@ -400,11 +400,15 @@ fn render_timeline_markers(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let y = area.y.saturating_add(1);
+    let excluded = centered_label_span(area, label);
     let buffer = frame.buffer_mut();
     let span = (right - left) as f64;
     for bookmark in bookmarks {
         let ratio = (bookmark.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
         let x = left + (ratio * span).round() as u16;
+        if excluded.is_some_and(|(start, end)| x >= start && x <= end) {
+            continue;
+        }
         buffer
             .get_mut(x.min(right), y)
             .set_symbol("│")
@@ -412,7 +416,7 @@ fn render_timeline_markers(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_chapter_markers(frame: &mut Frame, app: &App, area: Rect) {
+fn render_chapter_markers(frame: &mut Frame, app: &App, area: Rect, label: &str) {
     let Some(snapshot) = app.playback_snapshot() else {
         return;
     };
@@ -431,16 +435,38 @@ fn render_chapter_markers(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let y = area.y.saturating_add(1);
+    let excluded = centered_label_span(area, label);
     let buffer = frame.buffer_mut();
     let span = (right - left) as f64;
     for chapter in chapters {
         let ratio = (chapter.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
         let x = left + (ratio * span).round() as u16;
+        if excluded.is_some_and(|(start, end)| x >= start && x <= end) {
+            continue;
+        }
         buffer
             .get_mut(x.min(right), y)
             .set_symbol("┆")
             .set_fg(Color::Yellow);
     }
+}
+
+fn centered_label_span(area: Rect, label: &str) -> Option<(u16, u16)> {
+    let left = area.x.saturating_add(1);
+    let right = area.right().saturating_sub(2);
+    if right <= left {
+        return None;
+    }
+
+    let inner_width = right.saturating_sub(left).saturating_add(1);
+    let label_width = (label.chars().count() as u16).min(inner_width);
+    if label_width == 0 {
+        return None;
+    }
+
+    let start = left + inner_width.saturating_sub(label_width) / 2;
+    let end = start.saturating_add(label_width.saturating_sub(1));
+    Some((start, end.min(right)))
 }
 
 pub fn hit_test(area: Rect, column: u16, row: u16) -> Option<HitTarget> {

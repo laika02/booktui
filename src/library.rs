@@ -2,6 +2,8 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
     time::UNIX_EPOCH,
 };
 
@@ -25,6 +27,7 @@ pub struct LibraryItem {
     pub extension: String,
     pub parent_label: String,
     pub modified_epoch_seconds: u64,
+    pub duration: Option<Duration>,
 }
 
 pub fn scan_library(directories: &[PathBuf], cache: &mut LibraryCache) -> Vec<LibraryItem> {
@@ -71,7 +74,9 @@ fn visit_directory(
         seen_keys.push(cache_key.clone());
 
         let item = if let Some(cached) = cache.entries.get(&cache_key) {
-            if cached.modified_epoch_seconds == modified_epoch_seconds {
+            if cached.modified_epoch_seconds == modified_epoch_seconds
+                && cached.duration_seconds.is_some()
+            {
                 LibraryItem {
                     path: entry_path,
                     title: cached.title.clone(),
@@ -79,6 +84,7 @@ fn visit_directory(
                     extension: cached.extension.clone(),
                     parent_label: cached.parent_label.clone(),
                     modified_epoch_seconds: cached.modified_epoch_seconds,
+                    duration: cached.duration_seconds.map(Duration::from_secs_f64),
                 }
             } else {
                 rebuild_item(entry_path, modified_epoch_seconds, cache, cache_key)
@@ -97,7 +103,7 @@ fn rebuild_item(
     cache: &mut LibraryCache,
     cache_key: String,
 ) -> LibraryItem {
-    let metadata_title = read_metadata_title(&entry_path);
+    let (metadata_title, duration) = read_media_info(&entry_path);
     let item = LibraryItem {
         title: metadata_title
             .clone()
@@ -111,6 +117,7 @@ fn rebuild_item(
         parent_label: parent_label(&entry_path),
         modified_epoch_seconds,
         path: entry_path,
+        duration,
     };
 
     cache.entries.insert(
@@ -121,6 +128,7 @@ fn rebuild_item(
             extension: item.extension.clone(),
             parent_label: item.parent_label.clone(),
             modified_epoch_seconds: item.modified_epoch_seconds,
+            duration_seconds: item.duration.map(|duration| duration.as_secs_f64()),
         },
     );
 
@@ -159,8 +167,11 @@ fn modified_epoch_seconds(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_metadata_title(path: &Path) -> Option<String> {
-    let source = fs::File::open(path).ok()?;
+fn read_media_info(path: &Path) -> (Option<String>, Option<Duration>) {
+    let source = match fs::File::open(path) {
+        Ok(source) => source,
+        Err(_) => return (None, None),
+    };
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(OsStr::to_str) {
@@ -174,7 +185,10 @@ fn read_metadata_title(path: &Path) -> Option<String> {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .ok()?;
+        .ok();
+    let Some(probed) = probed else {
+        return (None, None);
+    };
     let mut format = probed.format;
 
     while !format.metadata().is_latest() {
@@ -182,17 +196,43 @@ fn read_metadata_title(path: &Path) -> Option<String> {
     }
 
     let metadata = format.metadata();
-    let revision = metadata.current()?;
-    revision
-        .tags()
-        .iter()
-        .find(|tag| matches!(tag.std_key, Some(StandardTagKey::TrackTitle)))
-        .map(|tag| tag.value.to_string())
-        .or_else(|| {
-            revision
-                .tags()
-                .iter()
-                .find(|tag| tag.key.eq_ignore_ascii_case("title"))
-                .map(|tag| tag.value.to_string())
-        })
+    let title = metadata.current().and_then(|revision| {
+        revision
+            .tags()
+            .iter()
+            .find(|tag| matches!(tag.std_key, Some(StandardTagKey::TrackTitle)))
+            .map(|tag| tag.value.to_string())
+            .or_else(|| {
+                revision
+                    .tags()
+                    .iter()
+                    .find(|tag| tag.key.eq_ignore_ascii_case("title"))
+                    .map(|tag| tag.value.to_string())
+            })
+    });
+
+    let duration = probe_duration(path);
+
+    (title, duration)
+}
+
+fn probe_duration(path: &Path) -> Option<Duration> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let seconds = text.trim().parse::<f64>().ok()?;
+    Some(Duration::from_secs_f64(seconds.max(0.0)))
 }

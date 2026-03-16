@@ -20,7 +20,7 @@ It is designed around local audiobook playback in the terminal: track directorie
 
 - Linux
 - A working audio output device supported by `rodio` / `cpal`
-- `ffprobe` in `PATH` if you want `m4b` chapter detection
+- `ffprobe` in `PATH` if you want `m4b` chapter detection and reliable scanned duration metadata
 
 For development from source:
 
@@ -211,7 +211,7 @@ This makes moves inside the library friendlier, but it can merge state for files
 - Any keypress counts as interaction for the idle timer
 - The sleep timer is separate from idle auto-pause
 - Broken or unsupported files should fail with an in-app error instead of crashing the TUI
-- `m4b` chapter detection is best-effort and depends on what `ffprobe` can read from the file
+- `m4b` chapter detection and scanned duration metadata are best-effort and depend on what `ffprobe` can read from the file
 
 ## Project Status
 
