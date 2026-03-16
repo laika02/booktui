@@ -209,6 +209,7 @@ fn render_transport(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw("/ filter  "),
             Span::raw("s sort  "),
             Span::raw("e seek by  "),
+            Span::raw("u undo seek  "),
             Span::raw("d drop root  "),
             Span::raw("Enter play  "),
             Span::raw("Space pause  "),

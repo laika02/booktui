@@ -42,6 +42,12 @@ pub enum LibraryRow {
     Item { item_index: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DragLock {
+    Timeline { area: Rect },
+    Volume { area: Rect },
+}
+
 pub struct App {
     storage: Storage,
     config: Config,
@@ -59,6 +65,9 @@ pub struct App {
     last_resume_save_at: Instant,
     resume_store: ResumeStore,
     library_cache: LibraryCache,
+    drag_lock: Option<DragLock>,
+    seek_undo_stack: Vec<Duration>,
+    preview_seek_position: Option<Duration>,
 }
 
 impl App {
@@ -90,6 +99,9 @@ impl App {
             last_resume_save_at: Instant::now(),
             resume_store,
             library_cache,
+            drag_lock: None,
+            seek_undo_stack: Vec::new(),
+            preview_seek_position: None,
         };
 
         let selected = initial_selection(
@@ -130,6 +142,11 @@ impl App {
                         self.last_interaction_at = Instant::now();
                         let area = terminal.size()?;
                         self.handle_mouse_event(area, mouse.column, mouse.row)?;
+                    }
+                    Event::Mouse(mouse)
+                        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) =>
+                    {
+                        self.handle_mouse_up();
                     }
                     _ => {}
                 }
@@ -185,7 +202,11 @@ impl App {
     }
 
     pub fn playback_snapshot(&self) -> Option<PlaybackSnapshot> {
-        self.player.snapshot()
+        let mut snapshot = self.player.snapshot()?;
+        if let Some(preview) = self.preview_seek_position {
+            snapshot.position = preview;
+        }
+        Some(snapshot)
     }
 
     pub fn current_duration(&self) -> Option<Duration> {
@@ -283,6 +304,7 @@ impl App {
             KeyCode::Char('a') => self.begin_input(InputMode::AddDirectory, String::new()),
             KeyCode::Char('/') => self.begin_input(InputMode::Search, self.filter_query.clone()),
             KeyCode::Char('e') => self.begin_input(InputMode::Seek, String::new()),
+            KeyCode::Char('u') => self.undo_last_seek()?,
             KeyCode::Char('r') => self.rescan_library()?,
             KeyCode::Char('d') => self.remove_selected_root()?,
             KeyCode::Char('s') => self.cycle_sort_mode()?,
@@ -296,10 +318,12 @@ impl App {
                 self.persist_current_resume()?;
             }
             KeyCode::Left | KeyCode::Char('h') => {
+                self.capture_seek_undo();
                 self.player.seek_relative(SEEK_STEP, false)?;
                 self.persist_current_resume()?;
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                self.capture_seek_undo();
                 self.player.seek_relative(SEEK_STEP, true)?;
                 self.persist_current_resume()?;
             }
@@ -706,6 +730,7 @@ impl App {
             SeekSpec::RelativeBackward(duration) => current.saturating_sub(duration),
         };
 
+        self.capture_seek_undo();
         self.player.seek_to(target)?;
         self.persist_current_resume()?;
         self.status = format!("Seeked to {}", ui::format_duration(target));
@@ -713,24 +738,66 @@ impl App {
     }
 
     fn handle_mouse_event(&mut self, area: Rect, column: u16, row: u16) -> Result<()> {
-        match ui::hit_test(area, column, row) {
-            Some(HitTarget::Timeline { area }) => {
+        let lock = self.drag_lock;
+        let target = lock.or_else(|| match ui::hit_test(area, column, row) {
+            Some(HitTarget::Timeline { area }) => Some(DragLock::Timeline { area }),
+            Some(HitTarget::Volume { area }) => Some(DragLock::Volume { area }),
+            None => None,
+        });
+
+        match target {
+            Some(DragLock::Timeline { area }) => {
                 let Some(duration) = self.player.duration() else {
                     return Ok(());
                 };
+                if self.drag_lock.is_none() {
+                    self.capture_seek_undo();
+                }
+                self.drag_lock = Some(DragLock::Timeline { area });
                 let ratio = ui::ratio_from_gauge_click(area, column);
                 let target = Duration::from_secs_f64(duration.as_secs_f64() * ratio);
-                self.player.seek_to(target)?;
-                self.persist_current_resume()?;
-                self.status = format!("Seeked to {}", ui::format_duration(target));
+                self.preview_seek_position = Some(target);
+                self.status = format!("Preview seek {}", ui::format_duration(target));
             }
-            Some(HitTarget::Volume { area }) => {
+            Some(DragLock::Volume { area }) => {
+                self.drag_lock = Some(DragLock::Volume { area });
                 let ratio = ui::ratio_from_gauge_click(area, column);
                 let volume = (ratio * 100.0).round() as u8;
                 self.set_volume(volume)?;
             }
             None => {}
         }
+        Ok(())
+    }
+
+    fn handle_mouse_up(&mut self) {
+        if let Some(target) = self.preview_seek_position.take() {
+            if self.player.seek_to(target).is_ok() {
+                let _ = self.persist_current_resume();
+                self.status = format!("Seeked to {}", ui::format_duration(target));
+            }
+        }
+        self.drag_lock = None;
+    }
+
+    fn capture_seek_undo(&mut self) {
+        if self.player.current_file().is_some() {
+            self.seek_undo_stack.push(self.player.current_position());
+            if self.seek_undo_stack.len() > 3 {
+                let overflow = self.seek_undo_stack.len() - 3;
+                self.seek_undo_stack.drain(..overflow);
+            }
+        }
+    }
+
+    fn undo_last_seek(&mut self) -> Result<()> {
+        let Some(target) = self.seek_undo_stack.pop() else {
+            self.status = "No seek to undo.".to_owned();
+            return Ok(());
+        };
+        self.player.seek_to(target)?;
+        self.persist_current_resume()?;
+        self.status = format!("Undid seek to {}", ui::format_duration(target));
         Ok(())
     }
 
